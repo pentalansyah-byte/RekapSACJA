@@ -1,0 +1,204 @@
+const spreadsheetId      = '1LkIl4uGRp-Cy78w_Za42BUuCg_LCo01Qe1b7wTqW9ks';
+const dataOrderSheetName = 'DATA';
+
+const botHandle      = '@RekapSACJA_bot';
+const botToken       = '8442719247:AAHMykO_S6yhbOq5wOqwxA-LXID4CbD3lt8';
+const appsScriptUrl  = 'https://script.google.com/macros/s/AKfycbzZ3ngjaFWKDG1z-z12jTg25CRR0iM_ayTFM6NRPdxCRQ9AcCutGVuzW713VhbjAt0/exec';
+const telegramApiUrl = `https://api.telegram.org/bot${botToken}`;
+
+
+const validJenisPekerjaan = new Set(['AO','MO','PDA','DIS','REG FISIK','REG LOGIC','SQM','UNSPEC', 'NODE B', 'LAPSUNG LOGIC','LAPSUNG FISIK','TANGIBLE ODC','TANGIBLE ODP','VALIDASI TIHANG','SURVEY PT2','PT2','INFRACARE','VALINS','OBSOLETE','SPBU', 'GAMAS']);
+const validSegment        = new Set(['B2C','B2B','-']);
+const validTeknisi        = new Set([
+  'ARI', 'AZRIL', 'RIZA', 'ATE', 'HARI', 'MAHDARLENA', 'IRVAN', 'DUDIN', 'KHAERUL', 'AGNA', 'DIKA', 'ANDI', 'FAJAR', 'HADI', 'IZMA', 'IPAN', 'RAMADHAN', 'MAULANA', 'NOVAL', 'RAMLI', 'DIKI', 'SEWU', 'RAHMATULLOH', 'GUMILAR', 'BAYU', 'ANDRIANA', 'FAUZI', 'RASHIF', 'TAUPIK', 'IMAM', 'TINA', 'GUNGUN', 'RADIT', 'RENO', 'YOSEP', 'SUHENDRI', 'WAWAN', 'JUDIKA', 'RAFLY', 'BAMBANG', 'ZAENI', 'RIAN', 'RAMA', 'RUSLAN', 'DIMAS', 'ERIK', 'EVAN', 'HARI P', 'RIYAN', 'YAYAT', 'RIKI', 'JAJAT', 'GALIH', 'JANUAR', 'SHOVIAN', 'RISNANDAR', 'RIDZAL', 'TEDY', 'WAHYU', 'AGUNG', 'ARIS', 'DANI W', 'DONA', 'NURONI', 'HARRY K', 'SANDI', 'TIMUR', 'URI', 'RAMA H', 'RIFAN', 'SAYID', 'SOPIYAN', 'WAHYU R', 'RAMDANI', 'YAI', 'AFRIZAL', 'AHMAD', 'DEDI', 'RENDY', 'RYAN', 'BUDI', 'DODO','ASEP', 'DANI', 'NADHI', 'RAHMAT', 'RENALDI', 'WAHYU N', 'ANDRI', 'BAGUS', 'BANGKIT', 'BAYU S', 'ZAKI', 'SANJAYA', 'YOGA', 'DARMAWAN', '-'
+]);
+
+function doPost(e) {
+  try {
+    const contents = JSON.parse(e.postData.contents);
+    const msg = contents.message;
+    if (!msg || msg.from.is_bot) return;
+
+    const chatId   = msg.chat.id;
+    const messageId = msg.message_id;
+    const text     = (msg.text || '').replace(botHandle, '').trim();
+    const firstName = msg.from.first_name || '';
+    const lastName  = msg.from.last_name || '';
+    const namaLengkap = `${firstName} ${lastName}`.trim();
+
+  
+    const props = PropertiesService.getScriptProperties();
+    const lastMsgId = props.getProperty('lastMessageId');
+    if (String(lastMsgId) === String(messageId)) return;
+    props.setProperty('lastMessageId', String(messageId));
+
+    let reply = '';
+    Logger.log(`Pesan dari ${namaLengkap}: ${text}`);
+
+    if (text.toLowerCase() === '/start') {
+      reply = `Halo, ${firstName}! Bot dalam keadaan aktif ✅`;
+      return sendTelegramMessage(chatId, messageId, reply);
+    }
+
+    if (text.split('\n')[0].toLowerCase() === '/rekap') {
+      const parsed = parseMessage(text);
+
+      if (!parsed || Object.values(parsed).some(v => !v)) {
+        return sendTelegramMessage(chatId, messageId, '⚠️ Format tidak lengkap atau ada yang kosong.\nGunakan /format untuk melihat format input.');
+      }
+
+      const { jenisPekerjaan, segment, noOrderIn, namaTeknisi1, namaTeknisi2, noInetVoice } = parsed;
+
+      if (!validJenisPekerjaan.has(jenisPekerjaan)) {
+        return sendTelegramMessage(chatId, messageId, `Jenis Pekerjaan tidak valid:\n\n${[...validJenisPekerjaan].join(', ')}`);
+      }
+      if (!validSegment.has(segment)) {
+        return sendTelegramMessage(chatId, messageId, `Segment tidak valid:\n\n${[...validSegment].join(', ')}`);
+      }
+      if (!validTeknisi.has(namaTeknisi1) || !validTeknisi.has(namaTeknisi2)) {
+        return sendTelegramMessage(chatId, messageId,
+          `Nama teknisi tidak valid.\nGunakan salah satu dari:\n\n${[...validTeknisi].filter(t => t !== '-').join(', ')}\n\nGunakan "-" jika hanya satu teknisi.`);
+      }
+
+     
+      const allowDup = new Set(['VALINS','VALIDASI TIHANG','SURVEY','TEMPORER']);
+      if (!allowDup.has(jenisPekerjaan) && noOrderIn !== '-') {
+        const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(dataOrderSheetName);
+        const colE = sheet.getRange('E2:E' + sheet.getLastRow()).getValues().flat();
+        const idx = colE.indexOf(noOrderIn);
+        if (idx !== -1) {
+          const row = idx + 2;
+          const teknisi1 = sheet.getRange(`H${row}`).getValue();
+          const teknisi2 = sheet.getRange(`I${row}`).getValue();
+          const tgl = sheet.getRange(`B${row}`).getValue();
+          const tglFmt = formatTanggal(tgl);
+          return sendTelegramMessage(chatId, messageId, `⚠️ Order ini sudah pernah diinput oleh <b>${teknisi1}</b> & <b>${teknisi2}</b> pada ${tglFmt}`);
+        }
+      }
+
+      const success = inputDataOrder({ ...parsed, chatId, namaLengkap });
+      if (!success) return sendTelegramMessage(chatId, messageId, `❌ Gagal menyimpan data.`);
+
+      let infoCount = '';
+      if (noInetVoice && /^\d+$/.test(noInetVoice)) {
+        const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(dataOrderSheetName);
+        const lastRow = sheet.getLastRow();
+        const startRow = Math.max(2, lastRow - 4999);
+        const range = sheet.getRange(startRow, 1, lastRow - startRow + 1, sheet.getLastColumn());
+        const data = range.getValues();
+
+        const matched = data
+        .map((row, idx) => ({ rowNum: startRow + idx, data: row }))
+        .filter(r => String(r.data[5]).trim() === noInetVoice);
+
+        if (matched.length > 1) {
+          infoCount += `\n\n<b>NO INET/VOICE</b> ini sudah pernah diinput sebanyak <b>${matched.length}</b> kali:\n`;
+          matched.forEach(r => {
+            const tgl = formatTanggal(r.data[1]);
+            infoCount += `• Oleh <b>${r.data[7]}</b> & <b>${r.data[8]}</b> pada ${tgl}\n`;
+          });
+        }
+      }
+
+      reply = `✅ Data berhasil disimpan dengan ID Order <b>${noOrderIn}</b>${infoCount}`;
+      return sendTelegramMessage(chatId, messageId, reply);
+    }
+
+    if (text.toLowerCase() === '/format') {
+      reply = `<pre>/rekap
+Jenis Pekerjaan: AO/MO/PDA/DIS/REG FISIK/REG LOGIC/SQM/UNSPEC/NODE B/LAPSUNG LOGIC/LAPSUNG FISIK/TANGIBLE ODC/TANGIBLE ODP/VALIDASI TIHANG/SURVEY PT2/PT2/INFRACARE/VALINS/OBSOLETE/SPBU/GAMAS.
+Segment: B2C/B2B/-
+No Order/IN:
+No Inet/Voice: (JIKA DATIN ISI SID, JIKA NODE B ISI KODE SITE)
+Datek:
+Teknisi 1:
+Teknisi 2:
+Perbaikan:
+Keterangan:
+TIKOR:</pre>`;
+      return sendTelegramMessage(chatId, messageId, reply);
+    }
+
+    sendTelegramMessage(chatId, messageId, `⚠️ Perintah tidak dikenali.\nGunakan /format untuk melihat cara input yang benar.`);
+
+  } catch (err) {
+    Logger.log(`❌ Error doPost: ${err.message}`);
+  }
+}
+
+function parseMessage(msg) {
+  const lines = msg.split('\n');
+  const data = {
+    jenisPekerjaan: '', segment: '', noOrderIn: '', noInetVoice: '', datek: '',
+    namaTeknisi1: '', namaTeknisi2: '', perbaikan: '', keterangan: '', tikor: ''
+  };
+
+  lines.forEach(line => {
+    const [key, ...rest] = line.split(':');
+    if (!rest.length) return;
+    const value = rest.join(':').trim();
+    const k = key.trim().toUpperCase();
+
+    if (k.includes('JENIS')) data.jenisPekerjaan = value.toUpperCase();
+    else if (k === 'SEGMENT') data.segment = value.toUpperCase();
+    else if (k === 'NO ORDER/IN') data.noOrderIn = value.toUpperCase();
+    else if (k === 'NO INET/VOICE') data.noInetVoice = value.trim();
+    else if (k === 'DATEK') data.datek = value.trim();
+    else if (k === 'TEKNISI 1') data.namaTeknisi1 = value.toUpperCase();
+    else if (k === 'TEKNISI 2') data.namaTeknisi2 = value.toUpperCase();
+    else if (k === 'PERBAIKAN') data.perbaikan = value.trim();
+    else if (k === 'KETERANGAN') data.keterangan = value.trim();
+    else if (k === 'TIKOR') data.tikor = value.trim();
+  });
+
+  return Object.values(data).every(v => v === '') ? false : data;
+}
+
+function inputDataOrder(data) {
+  try {
+    const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(dataOrderSheetName);
+    const row = [
+      sheet.getLastRow(), new Date(), data.jenisPekerjaan, data.segment, data.noOrderIn,
+      data.noInetVoice, data.datek, data.namaTeknisi1, data.namaTeknisi2,
+      data.perbaikan, data.keterangan, data.tikor, data.chatId, data.namaLengkap
+    ];
+    sheet.appendRow(row);
+    return true;
+  } catch (err) {
+    Logger.log(`❌ Error inputDataOrder: ${err.message}`);
+    return false;
+  }
+}
+
+function sendTelegramMessage(chatId, messageId, text) {
+  try {
+    const payload = {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      reply_to_message_id: messageId
+    };
+    UrlFetchApp.fetch(`${telegramApiUrl}/sendMessage`, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(payload)
+    });
+  } catch (err) {
+    Logger.log(`❌ Error sendTelegramMessage: ${err.message}`);
+  }
+}
+
+function formatTanggal(tgl) {
+  try {
+    return new Date(tgl).toLocaleDateString('id-ID', {
+      weekday: 'long', day: '2-digit', month: 'long', year: 'numeric'
+    });
+  } catch {
+    return tgl;
+  }
+}
+
+function setWebhook() {
+  const res = UrlFetchApp.fetch(`${telegramApiUrl}/setWebhook?url=${appsScriptUrl}`).getContentText();
+  Logger.log(`Webhook Response: ${res}`);
+}
