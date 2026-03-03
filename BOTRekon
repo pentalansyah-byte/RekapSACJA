@@ -1,0 +1,1055 @@
+// ========== KONFIGURASI ==========
+const PDF_OCR_TOKEN = '7955298073:AAHwzXpRnjQ0JkcccqMQ-yESLP4jho13kM8';
+const PDF_SPREADSHEET_ID = '1RALeHT_Gf8qbiQyc6J2LoT1YMGmwIUI98lj1o-p-33o';
+const PDF_SHEET_UTON = 'BA UTON';
+const PDF_SHEET_AMALIA = 'BA AMALIA';
+const TEMP_PDF_FOLDER_NAME = 'TEMP_PDF_UPLOADS';
+const MAX_BATCH_FILES = 10;
+const PDF_SPREADSHEET_ID_PS = '1RALeHT_Gf8qbiQyc6J2LoT1YMGmwIUI98lj1o-p-33o';
+const PDF_SHEET_NAME_PS = 'Rekap PS'; // atau sesuaikan dengan nama tab di spreadsheet
+const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbx8l3QyFBCHK2SBNZQHGULG3AIFWxsvNVFKyeJBynyZk3m0UmtyoDCIgbRpM5MBT74/exec';
+
+// ===== UTIL =====
+function normalizeMaterialKey(name) {
+  return String(name || '')
+    .toUpperCase()
+    .replace(/[\s\.\-]+/g, ''); // hilangkan spasi, titik, dash
+}
+
+function setWebhook() {
+  const url = 'https://api.telegram.org/bot' + PDF_OCR_TOKEN + '/setWebhook';
+  const payload = {
+    url: WEB_APP_URL
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  Logger.log(response.getContentText());
+}
+
+function deleteWebhook() {
+  const url = 'https://api.telegram.org/bot' + PDF_OCR_TOKEN + '/deleteWebhook';
+  const response = UrlFetchApp.fetch(url, { method: 'post' });
+  Logger.log(response.getContentText());
+}
+
+function resetUserFolder(chatId) {
+  try {
+    const folder = getOrCreateTempFolder(chatId);
+
+    // Hapus semua file
+    const files = folder.getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      f.setTrashed(true);
+    }
+
+    // Hapus semua subfolder (kalau ada)
+    const subFolders = folder.getFolders();
+    while (subFolders.hasNext()) {
+      const sf = subFolders.next();
+      sf.setTrashed(true);
+    }
+
+    return true;
+  } catch (err) {
+    Logger.log("❌ Gagal reset folder user " + chatId + ": " + err.message);
+    return false;
+  }
+}
+
+function testDriveAccess() {
+  const folder = DriveApp.getFoldersByName('TEMP_PDF_UPLOADS');
+  Logger.log(folder.hasNext() ? 'Folder ditemukan' : 'Folder tidak ada');
+}
+
+// ========== SET WEBHOOK ==========
+function doPost(e) {
+  const contents = JSON.parse(e.postData.contents);
+  if (!contents.message) return;
+
+  const chatId = contents.message.chat.id;
+  const text = (contents.message.text || '').trim();
+
+// === AUTO SAVE PDF DARI LINK AMALIA (MULTI LINK) ===
+const urls = extractAllUrls_(text)
+  .filter(u => u.includes("amalia_for_digital_signatur.php"));
+
+if (urls.length > 0) {
+  sendPdfBotMessage(chatId, `⏳ Terdeteksi ${urls.length} link, sedang mengambil PDF...`);
+
+  let ok = 0;
+  let fail = 0;
+
+  for (let i = 0; i < urls.length && i < 10; i++) {
+    try {
+      savePdfFromAmaliaLink_(urls[i], chatId);
+      ok++;
+    } catch (err) {
+      fail++;
+      Logger.log(`❌ Gagal link ${i+1}: ${err.message}`);
+    }
+  }
+
+  // DEBUG jumlah file di folder user
+  const folder = getOrCreateTempFolder(chatId);
+  let count = 0;
+  const it = folder.getFiles();
+  while (it.hasNext()) { it.next(); count++; }
+
+  sendPdfBotMessage(
+    chatId,
+    `✅ Selesai simpan PDF\nBerhasil: *${ok}*\nGagal: *${fail}*\n📁 Total file di folder kamu: *${count}*\n\nKetik */proses_amalia* untuk lanjut OCR`
+  );
+
+  return;
+}
+
+  function isProcessing(chatId) {
+    const key = 'PROCESSING_' + chatId;
+    return PropertiesService.getScriptProperties().getProperty(key) === 'true';
+  }
+
+  function setProcessing(chatId, flag) {
+    const key = 'PROCESSING_' + chatId;
+    PropertiesService.getScriptProperties().setProperty(key, flag ? 'true' : 'false');
+  }
+
+if (text === '/start') {
+  resetUserFolder(chatId);
+  sendPdfBotMessage(chatId, "👋 Selamat datang! Folder sementara kamu sudah dibersihkan. Silahkan upload file PDF baru.");
+  return;
+}
+
+// === Upload PDF ===
+if (contents.message.document) {
+  const fileId = contents.message.document.file_id;
+  const fileName = contents.message.document.file_name;
+
+  if (fileName.toLowerCase().endsWith('.pdf')) {
+    sendPdfBotMessage(chatId, '📥 Menerima file PDF, disimpan untuk diproses massal...');
+    try {
+      const fileBlob = getTelegramFileBlob(fileId);
+      const folder = getOrCreateTempFolder(chatId);
+      const uploadedFile = folder.createFile(fileBlob).setName(fileName);
+
+      sendPdfBotMessage(chatId, `✅ File *"${fileName}"* disimpan. Kirim */proses_uton* atau */proses_amalia* untuk mulai OCR massal (maks. ${MAX_BATCH_FILES} file).`);
+    } catch (err) {
+      sendPdfBotMessage(chatId, '❌ Gagal menyimpan file PDF: ' + err.message);
+    }
+    return;
+  } else {
+    sendPdfBotMessage(chatId, '⚠️ Hanya file PDF yang didukung.');
+    return;
+  }
+}
+
+// === Proses batch untuk UTON ===
+if (text === '/proses_uton') {
+  if (isProcessing(chatId)) {
+    sendPdfBotMessage(chatId, '⚠️ Proses sebelumnya belum selesai. Mohon tunggu dulu ya.');
+    return;
+  }
+  
+  try {
+    setProcessing(chatId, true);
+    const folder = getOrCreateTempFolder(chatId);
+    const files = folder.getFiles();
+    let processed = 0;
+
+    if (!files.hasNext()) {
+      sendPdfBotMessage(chatId, '⚠️ Tidak ada file PDF yang siap diproses. Upload dulu, lalu ulangi perintah ini.');
+      return;
+    }
+
+    while (files.hasNext() && processed < MAX_BATCH_FILES) {
+      if (!isProcessing(chatId)) {
+        sendPdfBotMessage(chatId, '🛑 Proses dibatalkan oleh user.');
+        break;
+      }
+
+      const file = files.next();
+      sendPdfBotMessage(chatId, `🔄 Memproses file *${file.getName()}* (UTON)...`);
+
+      try {
+        const ocrText = convertPdfToText(file);
+        const parsed = parseOcrToStructuredDataUTON(ocrText);
+        const summary = getSummaryText(parsed);
+        sendPdfBotMessage(chatId, summary);
+        saveParsedDataToSheet(parsed);
+        processed++;
+      } catch (err) {
+        sendPdfBotMessage(chatId, `❌ Gagal memproses *${file.getName()}*: ${err.message}`);
+      }
+    }
+
+    // Hapus semua file user setelah selesai
+    clearOldFiles(folder);
+
+    if (processed > 0) {
+      sendPdfBotMessage(chatId, `✅ Selesai memproses *${processed}* file PDF (UTON).`);
+    } else if (isProcessing(chatId)) {
+      sendPdfBotMessage(chatId, '⚠️ Tidak ada file yang berhasil diproses atau melebihi batas batch.');
+    }
+
+  } catch (err) {
+    sendPdfBotMessage(chatId, '❌ Gagal memproses batch PDF (UTON): ' + err.message);
+  } finally {
+    setProcessing(chatId, false);
+  }
+
+  return;
+}
+
+// === Proses batch untuk AMALIA ===
+if (text === '/proses_amalia') {
+    if (isProcessing(chatId)) {
+        sendPdfBotMessage(chatId, '⚠️ Proses sebelumnya belum selesai.');
+        return;
+    }
+
+    setProcessing(chatId, true);
+
+    try {
+        const folder = getOrCreateTempFolder(chatId);
+        const files = folder.getFiles();
+        let processed = 0;
+
+        if (!files.hasNext()) {
+            sendPdfBotMessage(chatId, '⚠️ Tidak ada file PDF yang siap diproses.');
+            return;
+        }
+
+        while (files.hasNext() && processed < MAX_BATCH_FILES) {
+            const file = files.next();
+            sendPdfBotMessage(chatId, `🔄 Memproses file *${file.getName()}* (AMALIA)...`);
+
+            try {
+                const ocrText = convertPdfToText(file);
+                const parsed = parseOcrToStructuredDataAMALIA(ocrText);
+                const summary = getSummaryTextRingkas(parsed);
+                sendPdfBotMessage(chatId, summary);
+                saveParsedDataRingkas(parsed);
+                processed++;
+            } catch (err) {
+                sendPdfBotMessage(chatId, `❌ Gagal memproses *${file.getName()}*: ${err.message}`);
+            }
+        }
+
+        clearOldFiles(folder);
+
+        sendPdfBotMessage(chatId, `✅ Selesai memproses *${processed}* file PDF (AMALIA).`);
+    } catch (err) {
+        sendPdfBotMessage(chatId, '❌ Gagal memproses batch PDF (AMALIA): ' + err.message);
+    } finally {
+        setProcessing(chatId, false);
+    }
+}
+
+// Proses manual /rekap_ps
+if (text.toLowerCase().startsWith('/rekap_ps')) {
+  // Gunakan LockService untuk mencegah eksekusi ganda
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) { // tunggu max 5 detik
+    sendPdfBotMessage(chatId, '⚠️ Proses sebelumnya belum selesai. Mohon tunggu dulu ya.');
+    return;
+  }
+
+  try {
+    const dataText = text.replace(/^\/rekap_ps\s*/i, '');
+    const parsed = parseRekapPsMessage(dataText);
+
+    const validation = validateParsedData(parsed);
+    if (!validation.valid) {
+      sendPdfBotMessage(chatId, '❌ Data tidak valid:\n' + validation.errors.join('\n'));
+      return;
+    }
+
+    saveParsedDataToSheetPS(parsed);
+    sendPdfBotMessage(chatId, '✅ Data berhasil direkap dan disimpan ke Google Sheet.');
+  } catch (err) {
+    sendPdfBotMessage(chatId, '❌ Gagal memproses data rekap_ps: ' + err.message);
+  } finally {
+    // Selalu lepaskan lock
+    lock.releaseLock();
+  }
+
+  return;
+  }
+
+  // Perintah cancel
+  if (text === '/cancel') {
+  if (isProcessing(chatId)) {
+    setProcessing(chatId, false);
+    sendPdfBotMessage(chatId, '🛑 Proses berhasil dibatalkan.');
+  } else {
+    sendPdfBotMessage(chatId, 'ℹ️ Tidak ada proses yang sedang berjalan.');
+  }
+  return;
+}
+
+  // Fallback
+  sendPdfBotMessage(chatId, '⚠️ Kirim file PDF, lalu gunakan /proses_uton, /proses_amalia, /rekap_ps, atau /cancel untuk mulai.');
+}
+
+function getOrCreateTempFolder(chatId) {
+  // pastikan folder root ada
+  const rootFolders = DriveApp.getFoldersByName(TEMP_PDF_FOLDER_NAME);
+  const root = rootFolders.hasNext() ? rootFolders.next() : DriveApp.createFolder(TEMP_PDF_FOLDER_NAME);
+
+  // cari folder user berdasarkan chatId
+  const userFolders = root.getFoldersByName(chatId.toString());
+  return userFolders.hasNext() ? userFolders.next() : root.createFolder(chatId.toString());
+}
+
+function clearOldFiles(folder) {
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    files.next().setTrashed(true);
+  }
+}
+
+function getTelegramFileBlob(fileId) {
+  const fileUrl = `https://api.telegram.org/bot${PDF_OCR_TOKEN}/getFile?file_id=${fileId}`;
+  const fileResponse = UrlFetchApp.fetch(fileUrl);
+  const filePath = JSON.parse(fileResponse.getContentText()).result.file_path;
+  return UrlFetchApp.fetch(`https://api.telegram.org/file/bot${PDF_OCR_TOKEN}/${filePath}`).getBlob();
+}
+
+function convertPdfToText(file) {
+  const blob = file.getBlob();
+
+  const importedFile = Drive.Files.create(
+    {
+      name: file.getName(),
+      mimeType: MimeType.GOOGLE_DOCS
+    },
+    blob,
+    {
+      ocr: true,
+      ocrLanguage: 'id'
+    }
+  );
+
+  const docId = importedFile.id;
+
+  // tunggu OCR selesai
+  Utilities.sleep(3000);
+
+  const text = DocumentApp.openById(docId).getBody().getText();
+
+  // hapus hasil OCR
+  DriveApp.getFileById(docId).setTrashed(true);
+
+  return text;
+}
+
+function extractFirstUrl_(text) {
+  if (!text) return '';
+  const m = text.match(/https?:\/\/\S+/i);
+  return m ? m[0].trim() : '';
+}
+
+function isValidUrl(text) {
+  return /^https?:\/\/\S+$/i.test((text || '').trim());
+}
+
+// ========== PARSER ==========
+function normalizeMaterialName(name) {
+  return name.trim().toUpperCase().replace(/\s+/g, '-').replace(/[^A-Z0-9\-]/g, '');
+}
+
+// --Untuk BA UTON--//
+function parseOcrToStructuredDataUTON(text) {
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '');
+  const findValue = (key) => {
+    const line = lines.find(l => l.toLowerCase().startsWith(key.toLowerCase() + ' :') || l.toLowerCase().startsWith(key.toLowerCase() + ':'));
+    if (line) {
+      const parts = line.split(':');
+      return parts.length > 1 ? parts.slice(1).join(':').trim() : '-';
+    }
+    return '-';
+  };
+
+  const layanan = text.includes('☑ 1P') ? '1P [Internet]' : '-';
+  const speedMatch = text.match(/☑\s*(\d+MB|\d+ GB)/i);
+  const speed = speedMatch ? speedMatch[1].toUpperCase() : '-';
+
+  const dateBlockMatch = text.match(/Tanggal WO\s*:\s*([^\n\r]+?)\s+Tanggal Transaksi\s*:\s*([^\n\r]+?)\s+Nama Pelanggan\s*:\s*([^\n\r]+)/i);
+
+  const ocrToHeaderMap = {
+    'TIANG GALVANIS': 'TIANG GALVANIS',
+    'TIANG REGULER': 'TIANG REGULER',
+    'AC-OF-SM-1-3SL': ['DROP CORE', 'DC ALL'],
+    'PRECON-1C-100-3SL': 'PRECON',
+    'PRECON-1C-150-3SL': 'PRECON',
+    'PRECON-1C-80-3SL': 'PRECON',
+    'S-CLAMP-SPRINER': 'S-CLAMP',
+    'CLAMP-HOOK': 'C-HOOK',
+    'OTP-FTTH-1': 'OTP',
+    'PREKSO INTRA-15-RS': 'PREKSO-15-RS',
+    'PREKSO INTRA-20-RS': 'PREKSO-20-RS',
+    'TC-2-160': 'TRAY',
+    'KLEM-RING-5-LUBANG': 'KLEM-RING-5-LUBANG',
+    'SOC-FUJ': 'SOC-FUJ',
+    'SOC-ILS': 'SOC-ILS',
+    'SOC-SUM': 'SOC-SUM',
+    'RJ45-6': 'RJ45',
+    'UTP-C6': 'UTP'
+  };
+
+  const materialMatches = [...text.matchAll(/([A-Z0-9\-\/\. ]+?)\s*:\s*(\d+)\s*(Pcs|Meter)/gi)];
+  const materialMap = {};
+
+  materialMatches.forEach(m => {
+    const rawName = normalizeMaterialName(m[1]);
+    const qty = parseInt(m[2], 10);
+
+    for (const [ocrName, mappedHeader] of Object.entries(ocrToHeaderMap)) {
+      const normOcr = normalizeMaterialName(ocrName);
+      if (rawName.includes(normOcr)) {
+        if (Array.isArray(mappedHeader)) {
+          mappedHeader.forEach(h => {
+            materialMap[h] = (materialMap[h] || 0) + qty;
+          });
+        } else {
+          materialMap[mappedHeader] = (materialMap[mappedHeader] || 0) + qty;
+        }
+      }
+    }
+  });
+
+  return {
+    STO: findValue('STO'),
+    noPermintaan: findValue('No Permintaan').replace(/\s+/g, ''),
+    noTelepon: findValue('No Telepon'),
+    noInet: findValue('No Inet'),
+    tanggalWO: dateBlockMatch ? dateBlockMatch[1].trim() : '-',
+    tanggalTransaksi: dateBlockMatch ? dateBlockMatch[2].trim() : '-',
+    namaPelanggan: dateBlockMatch ? dateBlockMatch[3].trim() : '-',
+    noKontak: findValue('No Kontak'),
+    rk: findValue('RK/MSAN/ODC'),
+    odp: findValue('DP/ODP'),
+    snOnt: findValue('SN ONT'),
+    snPlc: findValue('SN PLC'),
+    snWifi: findValue('SN WIFI EXT'),
+    stb: findValue('STB ID'),
+    teknisi: (() => {
+      const match = text.match(/Nama\s*\/\s*Notel\s*Teknisi\s*:\s*([^\n\r:]+?)(?=\s+STB Tambahan\s*:|$)/i);
+      return match ? match[1].trim() : '-';
+    })(),
+    mitra: findValue('Nama Mitra') || findValue('Mitra'),
+    stbTambahan: findValue('STB Tambahan'),
+    layanan,
+    speed,
+    materialMap
+  };
+}
+
+//--SAMPAI SINI UNTUK BA UTON--//
+
+//-Untuk BA Amalia/Super-Apps--//
+// ✅ PARSER OCR PDF KE STRUKTUR OBJEK
+function cleanLineValue(val) {
+  return val
+    .split(/\d+\.\s*[A-Z ]+ *:/)[0]  // potong sebelum key berikut
+    .replace(/[^\w\-\/\. ]+$/, '')   // buang karakter aneh di akhir
+    .trim();
+}
+
+function extractNoSC(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const idx = lines.findIndex(line => /^2\.\s*No Permintaan\s*:/i.test(line));
+  if (idx !== -1) {
+    const part1 = lines[idx + 1]?.replace(/\s/g, '') || '';
+    const part2 = lines[idx + 2]?.replace(/\s/g, '') || '';
+    return (part1 + part2).trim();
+  }
+  return '-';
+}
+
+function parseOcrToStructuredDataAMALIA(text) {
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+
+  const parsed = {
+    namaMitra: '',
+    nik: '',
+    nama: '',
+    baId: '-',
+    tanggalBa: '-',
+    woId: '-',
+    inet: '-',
+    noPermintaan: '-',
+    materialMap: {}
+  };
+
+  // === BA ID ===
+  const baLine = lines.find(line => line.toLowerCase().includes('no ba:'));
+  if (baLine) {
+    const match = baLine.match(/no ba\s*:\s*(\d{6,})/i);
+    if (match) parsed.baId = match[1];
+  }
+
+  // === Nama Mitra ===
+  const mitraLine = lines.find(line => line.toLowerCase().includes('nama mitra'));
+  if (mitraLine) {
+    const match = mitraLine.match(/:\s*(.+)/);
+    if (match) parsed.namaMitra = match[1].trim();
+  }
+
+  // === No SC (Gabungkan 3 Baris Setelah "No Permintaan") ===
+  const noSCIndex = lines.findIndex(line => /no permintaan\s*:/i.test(line));
+  if (noSCIndex !== -1) {
+    const part1 = (lines[noSCIndex].split(':')[1] || '').trim().replace(/\s+/g, '');
+    const part2 = (lines[noSCIndex + 1] || '').replace(/\s+/g, '');
+    const part3 = (lines[noSCIndex + 2] || '').replace(/\s+/g, '');
+    parsed.noPermintaan = (part1 + part2 + part3).trim();
+  }
+
+  // === No Inet ===
+  const inetLine = lines.find(line => /no inet/i.test(line));
+  if (inetLine) {
+    const match = inetLine.match(/no inet\s*:\s*(\d+)/i);
+    if (match) parsed.inet = match[1];
+  }
+
+  // === Tanggal BA (ambil yang format yyyy-mm-dd) ===
+  const tglLine = lines.find(line => /\b\d{4}-\d{2}-\d{2}\b/.test(line));
+  if (tglLine) {
+    const match = tglLine.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+    if (match) parsed.tanggalBa = match[1];
+  }
+
+  // === Nama Teknisi ===
+  const teknisiMatch = text.match(/Nama\s*\/\s*Notel\s*Teknisi\s*:\s*(.+?)\s*\/\s*/i);
+  if (teknisiMatch) parsed.nama = teknisiMatch[1].trim();
+
+  // === Material Raw Extraction ===
+  const materialMapRaw = {};
+  const startIdx = lines.findIndex(line => line.toLowerCase().includes("material"));
+  const endIdx = lines.findIndex(line => line.toLowerCase().includes("koordinat"));
+
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    const materialLines = lines.slice(startIdx + 1, endIdx).map(l => l.trim()).filter(Boolean);
+
+    let nameBuffer = [];
+
+    for (let line of materialLines) {
+      if (['tes layanan', 'test voice', 'test internet', 'useetv', 'catatan khusus']
+            .some(k => line.toLowerCase().includes(k))) continue;
+
+      // Jika baris hanya jumlah (format: ": 50")
+      const qtyMatch = line.match(/^:\s*(\d+)/);
+      if (qtyMatch && nameBuffer.length > 0) {
+        const fullName = nameBuffer.join(' ')
+          .replace(/^\d+\.\s*/, '')
+          .replace(/\.+$/, '')
+          .trim();
+
+        const qty = parseInt(qtyMatch[1], 10);
+        const key = normalizeMaterialKey(fullName);
+
+        // anti double
+        if (materialMapRaw[key] === qty) {
+          // skip
+        } else if (materialMapRaw[key] && materialMapRaw[key] !== qty) {
+          materialMapRaw[key] = materialMapRaw[key] + qty;
+        } else {
+          materialMapRaw[key] = qty;
+        }
+
+        nameBuffer = [];
+        continue;
+      }
+
+      // Format langsung: "1. AC-OF-SM-1-3SL : 50"
+      const directMatch = line.match(/^\d+\.\s*([A-Z0-9\-\/\. ]+)\s*[:：]\s*(\d+)/i);
+      if (directMatch) {
+        const name = directMatch[1].trim().replace(/\.+$/, '');
+        const qty = parseInt(directMatch[2], 10);
+        const key = normalizeMaterialKey(name);
+
+        // anti double
+        if (materialMapRaw[key] === qty) {
+          // skip
+        } else if (materialMapRaw[key] && materialMapRaw[key] !== qty) {
+          materialMapRaw[key] = materialMapRaw[key] + qty;
+        } else {
+          materialMapRaw[key] = qty;
+        }
+
+        nameBuffer = [];
+        continue;
+      }
+
+      // Baris nama material (multi-line)
+      if (/^[A-Z0-9\-\/\. ]+$/i.test(line)) {
+        nameBuffer.push(line);
+      } else {
+        nameBuffer = [];
+      }
+    }
+  } // ✅ PENTING: ini penutup blok if(startIdx...)
+
+  // === Mapping ke Header Sheet ===
+  const ocrToHeaderMap = {
+    'TIANG GALVANIS': 'TIANG GALVANIS',
+    'TIANG REGULER': 'TIANG REGULER',
+    'AC-OF-SM-1-3SL': ['DROP CORE', 'DC ALL'],
+    'PRECON-1C-100-3SL': 'PRECON',
+    'PRECON-1C-150-3SL': 'PRECON',
+    'PRECON-1C-80-3SL': 'PRECON',
+    'S-CLAMP-SPRINER': 'S-CLAMP',
+    'CLAMP-HOOK': 'C-HOOK',
+    'OTP-FTTH-1': 'OTP',
+    'PREKSO INTRA-15-RS': 'PREKSO-15-RS',
+    'PREKSO INTRA-20-RS': 'PREKSO-20-RS',
+    'TC-2-160': 'TRAY',
+    'KLEM-RING-5-LUBANG': 'KLEM-RING-5-LUBANG',
+    'SOC-FUJ': 'SOC-FUJ',
+    'SOC-ILS': 'SOC-ILS',
+    'SOC-SUM': 'SOC-SUM',
+    'RJ45-6': 'RJ45',
+    'UTP-C6': 'UTP'
+  };
+
+  const materialMap = {};
+  for (const [ocrKey, value] of Object.entries(materialMapRaw)) {
+    const matchedKey = Object.keys(ocrToHeaderMap).find(k =>
+      normalizeMaterialKey(ocrKey).includes(normalizeMaterialKey(k))
+    );
+
+    if (!matchedKey) continue;
+
+    const headerTarget = ocrToHeaderMap[matchedKey];
+    if (Array.isArray(headerTarget)) {
+      headerTarget.forEach(h => materialMap[h] = (materialMap[h] || 0) + value);
+    } else {
+      materialMap[headerTarget] = (materialMap[headerTarget] || 0) + value;
+    }
+  }
+
+  parsed.materialMap = materialMap;
+  return parsed;
+}
+
+// ✅ FORMAT OUTPUT UNTUK TELEGRAM
+function getSummaryTextRingkas(parsed) {
+  const lines = [
+    `📄 *Ringkasan Data PDF*`,
+    `• *NAMA MITRA:* ${parsed.namaMitra || '-'}`,
+    `• *NIK:* ${parsed.nik || '-'}`,
+    `• *NAMA:* ${parsed.nama || '-'}`,
+    `• *BA ID:* ${parsed.baId || '-'}`,
+    `• *TANGGAL BA:* ${parsed.tanggalBa || '-'}`,
+    `• *WO ID:* ${parsed.woId || '-'}`,
+    `• *INET:* ${parsed.inet || '-'}`,
+    `• *No SC:* ${parsed.noPermintaan || '-'}`
+  ];
+
+if (Object.keys(parsed.materialMap).length > 0) {
+  lines.push(`\n📦 *Material:*`);
+  for (let [key, value] of Object.entries(parsed.materialMap)) {
+    lines.push(`- ${key}: ${value} pcs`);
+  }
+}
+
+  return lines.join('\n');
+}
+
+//--SAMPAI SINI UNTUK BA AMALIA/SUPER-APPS--//
+
+
+// ========== SPREADSHEET ==========
+function saveParsedDataRingkas(parsed) {
+  const sheet = SpreadsheetApp.openById(PDF_SPREADSHEET_ID).getSheetByName(PDF_SHEET_AMALIA);
+
+  // Header tetap untuk AMALIA
+  const baseHeaders = [
+    'NAMA MITRA', 'NIK', 'NAMA', 'BA ID', 
+    'TANGGAL BA', 'WO ID', 'INET', 'No SC'
+  ];
+
+  const materialHeaders = Object.keys(parsed.materialMap);
+  const allHeaders = baseHeaders.concat(materialHeaders);
+
+  // Ambil header yang ada
+  let currentHeaders = [];
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(allHeaders);
+    currentHeaders = allHeaders;
+  } else {
+    currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    // Tambah header material baru jika belum ada
+    materialHeaders.forEach(header => {
+      if (!currentHeaders.includes(header)) {
+        currentHeaders.push(header);
+        sheet.getRange(1, currentHeaders.length, 1, 1).setValue(header);
+      }
+    });
+
+    // Pastikan urutan headers konsisten
+    allHeaders.length = 0;
+    allHeaders.push(...currentHeaders);
+  }
+
+  // Mapping field parsed ke header tetap
+  const fieldMap = {
+    'NAMA MITRA': 'namaMitra',
+    'NIK': 'nik',
+    'NAMA': 'nama',
+    'BA ID': 'baId',
+    'TANGGAL BA': 'tanggalBa',
+    'WO ID': 'woId',
+    'INET': 'inet',
+    'No SC': 'noPermintaan'
+  };
+
+  // Susun data untuk satu baris
+  const rowData = allHeaders.map(header => {
+    if (fieldMap[header]) {
+      return parsed[fieldMap[header]] || '';
+    } else {
+      return parsed.materialMap[header] || '';
+    }
+  });
+
+  sheet.appendRow(rowData);
+}
+
+// ========== RINGKASAN UNTUK TELEGRAM ==========
+function getSummaryText(parsed) {
+  const lines = [];
+  lines.push(`📄 *Ringkasan Data PDF*`);
+  lines.push(`• *STO:* ${parsed.STO}`);
+  lines.push(`• *No Permintaan:* ${parsed.noPermintaan}`);
+  lines.push(`• *No Telepon:* ${parsed.noTelepon}`);
+  lines.push(`• *No Inet:* ${parsed.noInet}`);
+  lines.push(`• *Tanggal WO:* ${parsed.tanggalWO}`);
+  lines.push(`• *Tanggal Transaksi:* ${parsed.tanggalTransaksi}`);
+  lines.push(`• *Nama Pelanggan:* ${parsed.namaPelanggan}`);
+  lines.push(`• *No Kontak:* ${parsed.noKontak}`);
+  lines.push(`• *RK/MSAN/ODC:* ${parsed.rk}`);
+  lines.push(`• *DP/ODP:* ${parsed.odp}`);
+  lines.push(`• *SN ONT:* ${parsed.snOnt}`);
+  lines.push(`• *SN PLC:* ${parsed.snPlc}`);
+  lines.push(`• *SN WIFI EXT:* ${parsed.snWifi}`);
+  lines.push(`• *STB ID:* ${parsed.stb}`);
+  lines.push(`• *Teknisi:* ${parsed.teknisi}`);
+  lines.push(`• *Mitra:* ${parsed.mitra}`);
+  lines.push(`• *Layanan:* ${parsed.layanan}`);
+  lines.push(`• *Speed:* ${parsed.speed}`);
+  lines.push(`• *STB Tambahan:* ${parsed.stbTambahan}`);
+
+  const mm = parsed.materialMap || {};
+  const keys = Object.keys(mm);
+
+  if (keys.length > 0) {
+    lines.push(`\n📦 *Material:*`);
+
+    // copy supaya aman saat delete key
+    const displayMap = Object.assign({}, mm);
+
+    // --- RAPINYA: tampilkan AC-OF-SM-1-3SL sekali saja ---
+    const dc = Number(displayMap['DROP CORE'] || 0);
+    const dcall = Number(displayMap['DC ALL'] || 0);
+
+    // kalau dua-duanya ada dan nilainya sama → tampil sekali, hapus salah satu biar tidak dobel
+    if (dc > 0 && dcall > 0 && dc === dcall) {
+      lines.push(`- AC-OF-SM-1-3SL: ${dc} pcs`);
+      delete displayMap['DROP CORE'];
+      delete displayMap['DC ALL'];
+    }
+
+    // tampilkan sisanya normal
+    for (let [key, value] of Object.entries(displayMap)) {
+      if (value === '' || value === null || value === undefined) continue;
+      const n = Number(value);
+      if (!isNaN(n) && n === 0) continue;
+      lines.push(`- ${key}: ${value} pcs`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function saveParsedDataToSheet(parsed) {
+  const sheet = SpreadsheetApp.openById(PDF_SPREADSHEET_ID).getSheetByName(PDF_SHEET_UTON);
+
+  // Header utama (kolom tetap)
+  const baseHeaders = [
+    'STO', 'No Permintaan', 'No Telepon', 'No Inet', 'Tanggal WO', 'Tanggal Transaksi',
+    'Nama Pelanggan', 'No Kontak', 'RK/MSAN/ODC', 'DP/ODP',
+    'SN ONT', 'SN PLC', 'SN WIFI EXT', 'STB ID',
+    'Teknisi', 'Mitra', 'Layanan', 'Speed', 'STB Tambahan'
+  ];
+
+  // Header material dari hasil parsing
+  const materialHeaders = Object.keys(parsed.materialMap);
+  const allHeaders = baseHeaders.concat(materialHeaders);
+
+  // Ambil header yang ada di sheet
+  let currentHeaders = [];
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(allHeaders);
+    currentHeaders = allHeaders;
+  } else {
+    currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    // Tambahkan header material baru jika belum ada
+    materialHeaders.forEach(header => {
+      if (!currentHeaders.includes(header)) {
+        currentHeaders.push(header);
+        sheet.getRange(1, currentHeaders.length, 1, 1).setValue(header);
+      }
+    });
+
+    // Pastikan allHeaders mencerminkan header terkini
+    allHeaders.length = 0;
+    allHeaders.push(...currentHeaders);
+  }
+
+  // Mapping field parsed ke header tetap
+  const fieldMap = {
+    'STO': 'STO',
+    'No Permintaan': 'noPermintaan',
+    'No Telepon': 'noTelepon',
+    'No Inet': 'noInet',
+    'Tanggal WO': 'tanggalWO',
+    'Tanggal Transaksi': 'tanggalTransaksi',
+    'Nama Pelanggan': 'namaPelanggan',
+    'No Kontak': 'noKontak',
+    'RK/MSAN/ODC': 'rk',
+    'DP/ODP': 'odp',
+    'SN ONT': 'snOnt',
+    'SN PLC': 'snPlc',
+    'SN WIFI EXT': 'snWifi',
+    'STB ID': 'stb',
+    'Teknisi': 'teknisi',
+    'Mitra': 'mitra',
+    'Layanan': 'layanan',
+    'Speed': 'speed',
+    'STB Tambahan': 'stbTambahan'
+  };
+
+  // Susun data untuk satu baris
+  const rowData = allHeaders.map(header => {
+    if (fieldMap[header]) {
+      return parsed[fieldMap[header]] || '';
+    } else {
+      return parsed.materialMap[header] || '';
+    }
+  });
+
+  sheet.appendRow(rowData);
+}
+
+// ========== TELEGRAM MESSAGE ==========
+function sendPdfBotMessage(chatId, text) {
+  const payload = {
+    chat_id: chatId,
+    text: escapeMarkdown(text),
+    parse_mode: 'MarkdownV2' // gunakan MarkdownV2 supaya escape karakter efektif
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload)
+  };
+
+  UrlFetchApp.fetch(`https://api.telegram.org/bot${PDF_OCR_TOKEN}/sendMessage`, options);
+}
+
+function escapeMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/\*/g, '\\*')
+    .replace(/_/g, '\\_')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(/~/g, '\\~')
+    .replace(/`/g, '\\`')
+    .replace(/>/g, '\\>')
+    .replace(/#/g, '\\#')
+    .replace(/\+/g, '\\+')
+    .replace(/-/g, '\\-')
+    .replace(/=/g, '\\=')
+    .replace(/\|/g, '\\|')
+    .replace(/\{/g, '\\{')
+    .replace(/\}/g, '\\}')
+    .replace(/\./g, '\\.')
+    .replace(/!/g, '\\!');
+}
+
+function resetAllProcessingFlags() {
+  const props = PropertiesService.getScriptProperties();
+  const all = props.getProperties();
+  let count = 0;
+  for (const key in all) {
+    if (key.startsWith('PROCESSING_')) {
+      props.deleteProperty(key);
+      count++;
+    }
+  }
+  Logger.log(`✅ Reset ${count} flag proses yang masih aktif.`);
+}
+
+function testDriveAdvanced() {
+  const files = Drive.Files.list();
+  Logger.log(files.items.length);
+}
+
+function getOrCreateFolderByName_(folderName) {
+  const it = DriveApp.getFoldersByName(folderName);
+  if (it.hasNext()) return it.next();
+  return DriveApp.createFolder(folderName);
+}
+
+function getNoWoFromUrl_(url) {
+  const m = url.match(/[?&]no_wo=([^&]+)/i);
+  return m ? decodeURIComponent(m[1]) : ("AMALIA_" + Date.now());
+}
+
+function extractPdfUrlFromHtml_(html, baseUrl) {
+  // cari URL .pdf di HTML
+  let m = html.match(/https?:\/\/[^\s"'<>]+\.pdf(\?[^\s"'<>]+)?/i);
+  if (m) return m[0];
+
+  // cari src="...pdf"
+  m = html.match(/src\s*=\s*["']([^"']+\.pdf[^"']*)["']/i);
+  if (m) {
+    const u = m[1];
+    if (u.startsWith("http")) return u;
+    // relatif -> jadikan absolut
+    const base = baseUrl.replace(/\/[^/]*$/, "/");
+    return base + u.replace(/^\//, "");
+  }
+
+  return null;
+}
+
+function savePdfFromAmaliaLink_(url, chatId) {
+  const noWo = getNoWoFromUrl_(url);
+  const userFolder = getOrCreateTempFolder(chatId);
+  const fileName = noWo + ".pdf";
+
+  // ✅ Skip kalau sudah ada (biar cepat)
+  const existed = userFolder.getFilesByName(fileName);
+  if (existed.hasNext()) return existed.next();
+
+  // helper fetch dengan timeout
+  function fetch_(u) {
+    return UrlFetchApp.fetch(u, {
+      followRedirects: true,
+      muteHttpExceptions: true,
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+  }
+
+  // 1) fetch link awal
+  let res = fetch_(url);
+
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) throw new Error("HTTP " + code);
+
+  const headers = res.getHeaders();
+  const ct = String(headers["Content-Type"] || headers["content-type"] || "").toLowerCase();
+
+  let pdfBlob;
+
+  // 2) jika direct PDF
+  if (ct.includes("application/pdf")) {
+    pdfBlob = res.getBlob().setName(fileName);
+
+  } else {
+    // 3) jika HTML wrapper → cari URL PDF
+    const html = res.getContentText();
+    const pdfUrl = extractPdfUrlFromHtml_(html, url);
+    if (!pdfUrl) throw new Error("Tidak menemukan URL PDF di halaman");
+
+    // fetch pdf
+    res = fetch_(pdfUrl);
+
+    const code2 = res.getResponseCode();
+    if (code2 < 200 || code2 >= 300) throw new Error("HTTP PDF " + code2);
+
+    pdfBlob = res.getBlob().setName(fileName);
+  }
+
+  // 4) simpan ke folder user
+  return userFolder.createFile(pdfBlob).setName(fileName);
+}
+
+function extractAllUrls_(text) {
+  if (!text) return [];
+  const m = text.match(/https?:\/\/\S+/gi);
+  return m ? m.map(u => u.trim()) : [];
+}
+
+function saveManyAmaliaLinks_(urls, chatId) {
+  const folder = getOrCreateTempFolder(chatId);
+
+  // batasi 10
+  const picked = urls.slice(0, 10);
+
+  // buat request awal (parallel)
+  const reqs = picked.map(u => ({
+    url: u,
+    method: "get",
+    followRedirects: true,
+    muteHttpExceptions: true,
+    headers: { "User-Agent": "Mozilla/5.0" }
+  }));
+
+  const resps = UrlFetchApp.fetchAll(reqs);
+
+  let ok = 0, fail = 0;
+
+  for (let i = 0; i < picked.length; i++) {
+    try {
+      const url = picked[i];
+      const noWo = getNoWoFromUrl_(url);
+      const fileName = noWo + ".pdf";
+
+      // skip duplikat
+      if (folder.getFilesByName(fileName).hasNext()) {
+        ok++;
+        continue;
+      }
+
+      const res = resps[i];
+      const code = res.getResponseCode();
+      if (code < 200 || code >= 300) throw new Error("HTTP " + code);
+
+      const headers = res.getHeaders();
+      const ct = String(headers["Content-Type"] || headers["content-type"] || "").toLowerCase();
+
+      // kalau bukan PDF (HTML wrapper), fallback ke single function
+      if (!ct.includes("application/pdf")) {
+        savePdfFromAmaliaLink_(url, chatId);
+        ok++;
+        continue;
+      }
+
+      const blob = res.getBlob().setName(fileName);
+      folder.createFile(blob);
+      ok++;
+    } catch (e) {
+      fail++;
+      Logger.log("❌ batch fail: " + e.message);
+    }
+  }
+
+  return { ok, fail };
+}
