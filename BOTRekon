@@ -13,7 +13,24 @@ const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbx8l3QyFBCHK2SBNZQH
 function normalizeMaterialKey(name) {
   return String(name || '')
     .toUpperCase()
-    .replace(/[\s\.\-]+/g, ''); // hilangkan spasi, titik, dash
+    .replace(/[^A-Z0-9]/g, ''); // sisakan huruf/angka agar variasi OCR tetap match
+}
+
+function matchMaterialHeaderFromKey(rawKey, ocrToHeaderMap) {
+  const normalizedRaw = normalizeMaterialKey(rawKey);
+
+  // Prioritas 1: mapping persis berdasarkan key resmi material
+  const exactKey = Object.keys(ocrToHeaderMap).find(k =>
+    normalizedRaw.includes(normalizeMaterialKey(k))
+  );
+  if (exactKey) return ocrToHeaderMap[exactKey];
+
+  // Prioritas 2: fallback OCR typo/variasi penulisan
+  if (normalizedRaw.includes('PRECON')) return 'PRECON';
+  if (normalizedRaw.includes('CLAMPHOOK')) return 'C-HOOK';
+  if (normalizedRaw.includes('SCLAMP') || normalizedRaw.includes('SPRINER')) return 'S-CLAMP';
+
+  return null;
 }
 
 function setWebhook() {
@@ -250,6 +267,8 @@ if (text === '/proses_amalia') {
     } finally {
         setProcessing(chatId, false);
     }
+
+    return;
 }
 
 // Proses manual /rekap_ps
@@ -367,22 +386,45 @@ function normalizeMaterialName(name) {
 
 // --Untuk BA UTON--//
 function parseOcrToStructuredDataUTON(text) {
-  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '');
-  const findValue = (key) => {
-    const line = lines.find(l => l.toLowerCase().startsWith(key.toLowerCase() + ' :') || l.toLowerCase().startsWith(key.toLowerCase() + ':'));
-    if (line) {
-      const parts = line.split(':');
-      return parts.length > 1 ? parts.slice(1).join(':').trim() : '-';
+  const stripNumberPrefix = line => String(line || '').replace(/^\d+\.\s*/, '').trim();
+  const normalizedLines = lines.map(stripNumberPrefix);
+  const sectionHeaders = new Set(['DATEK', 'MATERIAL', 'KOORDINAT']);
+
+  const isKeyLine = line => /^\d+\.\s*[A-Z][A-Za-z0-9\/\.() -]*\s*:/.test(line);
+
+  const escapeRegExp = val => String(val).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const findValue = (keys, opts = {}) => {
+    const keyList = Array.isArray(keys) ? keys : [keys];
+    const maxFollowLines = opts.maxFollowLines || 2;
+    const appendFollow = Boolean(opts.appendFollow);
+
+    const matchedIndex = normalizedLines.findIndex(line =>
+      keyList.some(k => new RegExp('^' + escapeRegExp(k) + '\\s*:', 'i').test(line))
+    );
+
+    if (matchedIndex === -1) return '-';
+
+    const line = normalizedLines[matchedIndex];
+    const valuePart = line.slice(line.indexOf(':') + 1).trim();
+
+    const follow = [];
+    for (let i = matchedIndex + 1; i < normalizedLines.length && follow.length < maxFollowLines; i++) {
+      const nextRaw = lines[i];
+      const next = normalizedLines[i];
+      if (!next || isKeyLine(nextRaw) || sectionHeaders.has(next.toUpperCase())) break;
+      follow.push(next);
     }
-    return '-';
+
+    if (valuePart && !appendFollow) return valuePart;
+
+    const merged = [valuePart, ...follow].filter(Boolean).join(' ').trim();
+    return merged || '-';
   };
 
   const layanan = text.includes('☑ 1P') ? '1P [Internet]' : '-';
   const speedMatch = text.match(/☑\s*(\d+MB|\d+ GB)/i);
   const speed = speedMatch ? speedMatch[1].toUpperCase() : '-';
-
-  const dateBlockMatch = text.match(/Tanggal WO\s*:\s*([^\n\r]+?)\s+Tanggal Transaksi\s*:\s*([^\n\r]+?)\s+Nama Pelanggan\s*:\s*([^\n\r]+)/i);
-
   const ocrToHeaderMap = {
     'TIANG GALVANIS': 'TIANG GALVANIS',
     'TIANG REGULER': 'TIANG REGULER',
@@ -391,26 +433,37 @@ function parseOcrToStructuredDataUTON(text) {
     'PRECON-1C-150-3SL': 'PRECON',
     'PRECON-1C-80-3SL': 'PRECON',
     'S-CLAMP-SPRINER': 'S-CLAMP',
+    'S-CLAMP-SPRINGER': 'S-CLAMP',
+    'SCLAMP': 'S-CLAMP',
+    'S-CLAMP': 'S-CLAMP',
+    'SCLAMPSPRINER': 'S-CLAMP',
+    'SCLAMPSPRINGER': 'S-CLAMP',
+    '5-CLAMP': 'S-CLAMP',
+    '5CLAMP': 'S-CLAMP',
     'CLAMP-HOOK': 'C-HOOK',
+    'CLAMPHOOK': 'C-HOOK',
     'OTP-FTTH-1': 'OTP',
     'PREKSO INTRA-15-RS': 'PREKSO-15-RS',
     'PREKSO INTRA-20-RS': 'PREKSO-20-RS',
     'TC-2-160': 'TRAY',
     'KLEM-RING-5-LUBANG': 'KLEM-RING-5-LUBANG',
+    'KLEM RING 5 LUBANG': 'KLEM-RING-5-LUBANG',
+    'KLEMRING5LUBANG': 'KLEM-RING-5-LUBANG',
     'SOC-FUJ': 'SOC-FUJ',
     'SOC-ILS': 'SOC-ILS',
     'SOC-SUM': 'SOC-SUM',
     'RJ45-6': 'RJ45',
     'UTP-C6': 'UTP'
   };
+  const normalizedText = text
+    .replace(/-\s*\r?\n\s*/g, '-')
+    .replace(/\r?\n\s*:\s*/g, ' : ');
 
-  const materialMatches = [...text.matchAll(/([A-Z0-9\-\/\. ]+?)\s*:\s*(\d+)\s*(Pcs|Meter)/gi)];
+  const materialMatches = [...normalizedText.matchAll(/([A-Z0-9\-\/\. ]+?)\s*:\s*(\d+)\s*(Pcs|Meter)/gi)];
   const materialMap = {};
 
-  materialMatches.forEach(m => {
-    const rawName = normalizeMaterialName(m[1]);
-    const qty = parseInt(m[2], 10);
-
+    const applyMaterial = (rawNameInput, qty) => {
+    const rawName = normalizeMaterialName(rawNameInput);
     for (const [ocrName, mappedHeader] of Object.entries(ocrToHeaderMap)) {
       const normOcr = normalizeMaterialName(ocrName);
       if (rawName.includes(normOcr)) {
@@ -423,19 +476,51 @@ function parseOcrToStructuredDataUTON(text) {
         }
       }
     }
-  });
+  };
+
+    const materialHeaderIndex = normalizedLines.findIndex(line => /^MATERIAL$/i.test(line));
+  if (materialHeaderIndex !== -1) {
+    for (let i = materialHeaderIndex + 1; i < lines.length; i++) {
+      const current = lines[i];
+      const currentNorm = normalizedLines[i];
+      if (/^KOORDINAT$/i.test(currentNorm)) break;
+
+      const itemStart = current.match(/^\d+\.\s*(.*)$/);
+      if (!itemStart) continue;
+
+      let itemText = itemStart[1].trim();
+      let j = i + 1;
+      while (j < lines.length && !itemText.includes(':')) {
+        const nextNorm = normalizedLines[j];
+        if (!nextNorm || /^\d+\./.test(lines[j]) || /^KOORDINAT$/i.test(nextNorm)) break;
+        itemText += ' ' + nextNorm;
+        j++;
+      }
+
+      const itemMatch = itemText.match(/^(.+?)\s*:\s*(\d+)/);
+      if (!itemMatch) continue;
+
+      applyMaterial(itemMatch[1], parseInt(itemMatch[2], 10));
+    }
+  }
+
+
+  if (Object.keys(materialMap).length === 0) {
+    const materialMatches = [...text.matchAll(/([A-Z0-9\-\/\. ]+?)\s*:\s*(\d+)(?:\s*(Pcs|Meter))?/gi)];
+    materialMatches.forEach(m => applyMaterial(m[1], parseInt(m[2], 10)));
+  }
 
   return {
     STO: findValue('STO'),
     noPermintaan: findValue('No Permintaan').replace(/\s+/g, ''),
     noTelepon: findValue('No Telepon'),
     noInet: findValue('No Inet'),
-    tanggalWO: dateBlockMatch ? dateBlockMatch[1].trim() : '-',
-    tanggalTransaksi: dateBlockMatch ? dateBlockMatch[2].trim() : '-',
-    namaPelanggan: dateBlockMatch ? dateBlockMatch[3].trim() : '-',
+    tanggalWO: findValue('Tanggal WO'),
+    tanggalTransaksi: findValue('Tanggal Transaksi'),
+    namaPelanggan: findValue('Nama Pelanggan', { maxFollowLines: 3, appendFollow: true }),
     noKontak: findValue('No Kontak'),
     rk: findValue('RK/MSAN/ODC'),
-    odp: findValue('DP/ODP'),
+    odp: findValue(['DP/ODP', 'ODP']),
     snOnt: findValue('SN ONT'),
     snPlc: findValue('SN PLC'),
     snWifi: findValue('SN WIFI EXT'),
@@ -444,7 +529,7 @@ function parseOcrToStructuredDataUTON(text) {
       const match = text.match(/Nama\s*\/\s*Notel\s*Teknisi\s*:\s*([^\n\r:]+?)(?=\s+STB Tambahan\s*:|$)/i);
       return match ? match[1].trim() : '-';
     })(),
-    mitra: findValue('Nama Mitra') || findValue('Mitra'),
+    mitra: findValue(['Nama Mitra', 'Mitra']),
     stbTambahan: findValue('STB Tambahan'),
     layanan,
     speed,
@@ -543,9 +628,11 @@ function parseOcrToStructuredDataAMALIA(text) {
     for (let line of materialLines) {
       if (['tes layanan', 'test voice', 'test internet', 'useetv', 'catatan khusus']
             .some(k => line.toLowerCase().includes(k))) continue;
+      
+      const cleanLine = line.replace(/^\d+\.\s*/, '').trim();
 
       // Jika baris hanya jumlah (format: ": 50")
-      const qtyMatch = line.match(/^:\s*(\d+)/);
+      const qtyMatch = cleanLine.match(/^:\s*(\d+)/);
       if (qtyMatch && nameBuffer.length > 0) {
         const fullName = nameBuffer.join(' ')
           .replace(/^\d+\.\s*/, '')
@@ -568,14 +655,13 @@ function parseOcrToStructuredDataAMALIA(text) {
         continue;
       }
 
-      // Format langsung: "1. AC-OF-SM-1-3SL : 50"
-      const directMatch = line.match(/^\d+\.\s*([A-Z0-9\-\/\. ]+)\s*[:：]\s*(\d+)/i);
+      // Format langsung: "1. AC-OF-SM-1-3SL : 50" atau "AC-OF-SM-1-3SL : 50 pcs"
+      const directMatch = line.match(/^(?:\d+\.\s*)?([A-Z0-9\-\/\. ]+)\s*[:：]\s*(\d+)\s*(?:PCS|PCS\.|METER|MTR)?$/i);
       if (directMatch) {
         const name = directMatch[1].trim().replace(/\.+$/, '');
         const qty = parseInt(directMatch[2], 10);
         const key = normalizeMaterialKey(name);
 
-        // anti double
         if (materialMapRaw[key] === qty) {
           // skip
         } else if (materialMapRaw[key] && materialMapRaw[key] !== qty) {
@@ -588,9 +674,59 @@ function parseOcrToStructuredDataAMALIA(text) {
         continue;
       }
 
-      // Baris nama material (multi-line)
-      if (/^[A-Z0-9\-\/\. ]+$/i.test(line)) {
-        nameBuffer.push(line);
+     // Format lanjutan hasil OCR (nama + qty tanpa nomor): "RING-5-LUBANG. : 1"
+      const bufferedQtyMatch = line.match(/^([A-Z0-9\-\/\. ]+)\s*[:：]\s*(\d+)$/i);
+      if (bufferedQtyMatch) {
+        const nameParts = nameBuffer.concat(bufferedQtyMatch[1]);
+        const fullName = nameParts.join(' ')
+          .replace(/^\d+\.\s*/, '')
+          .replace(/\.+$/, '')
+          .trim();
+
+        const qty = parseInt(bufferedQtyMatch[2], 10);
+        const key = normalizeMaterialKey(fullName);
+
+        if (materialMapRaw[key] === qty) {
+          // skip
+        } else if (materialMapRaw[key] && materialMapRaw[key] !== qty) {
+          materialMapRaw[key] = materialMapRaw[key] + qty;
+        } else {
+          materialMapRaw[key] = qty;
+        }
+
+        nameBuffer = [];
+        continue;
+      }
+
+
+      // Format lanjutan multi-line: "SPRINER. : 6" setelah buffer nama sebelumnya
+      const continuedMatch = cleanLine.match(/^([A-Z0-9\-\/\. ]+)\s*[:：]\s*(\d+)/i);
+      if (continuedMatch && nameBuffer.length > 0) {
+        const name = `${nameBuffer.join(' ')} ${continuedMatch[1]}`
+          .replace(/\s+/g, ' ')
+          .trim()
+          .replace(/\.+$/, '');
+        const qty = parseInt(continuedMatch[2], 10);
+        const key = normalizeMaterialKey(name);
+
+        if (materialMapRaw[key] === qty) {
+          // skip
+        } else if (materialMapRaw[key] && materialMapRaw[key] !== qty) {
+          materialMapRaw[key] = materialMapRaw[key] + qty;
+        } else {
+          materialMapRaw[key] = qty;
+        }
+
+        nameBuffer = [];
+        continue;
+      }
+
+      // Baris nama material (multi-line), termasuk jika nomor item berdiri sendiri (mis: "2.")
+      if (/^[A-Z0-9\-\/\. ]+$/i.test(cleanLine) && cleanLine !== '') {
+        nameBuffer.push(cleanLine);
+      } else if (/^\d+\.\s*$/.test(line)) {
+        // nomor item saja, abaikan tanpa reset buffer
+        continue;
       } else {
         nameBuffer = [];
       }
@@ -606,28 +742,39 @@ function parseOcrToStructuredDataAMALIA(text) {
     'PRECON-1C-150-3SL': 'PRECON',
     'PRECON-1C-80-3SL': 'PRECON',
     'S-CLAMP-SPRINER': 'S-CLAMP',
+    'S-CLAMP-SPRINGER': 'S-CLAMP',
+    'SCLAMP': 'S-CLAMP',
+    'S-CLAMP': 'S-CLAMP',
+    'SCLAMPSPRINER': 'S-CLAMP',
+    'SCLAMPSPRINGER': 'S-CLAMP',
+    '5-CLAMP': 'S-CLAMP',
+    '5CLAMP': 'S-CLAMP',
     'CLAMP-HOOK': 'C-HOOK',
+    'CLAMPHOOK': 'C-HOOK',
     'OTP-FTTH-1': 'OTP',
     'PREKSO INTRA-15-RS': 'PREKSO-15-RS',
     'PREKSO INTRA-20-RS': 'PREKSO-20-RS',
     'TC-2-160': 'TRAY',
     'KLEM-RING-5-LUBANG': 'KLEM-RING-5-LUBANG',
+    'KLEM RING 5 LUBANG': 'KLEM-RING-5-LUBANG',
+    'KLEMRING5LUBANG': 'KLEM-RING-5-LUBANG',
     'SOC-FUJ': 'SOC-FUJ',
     'SOC-ILS': 'SOC-ILS',
     'SOC-SUM': 'SOC-SUM',
     'RJ45-6': 'RJ45',
     'UTP-C6': 'UTP'
   };
+  
+  const normalizedText = text
+    .replace(/-\s*\r?\n\s*/g, '-')
+    .replace(/\r?\n\s*:\s*/g, ' : ');
 
+  const materialMatches = [...normalizedText.matchAll(/([A-Z0-9\-\/\. ]+?)\s*:\s*(\d+)\s*(Pcs|Meter)/gi)];
   const materialMap = {};
-  for (const [ocrKey, value] of Object.entries(materialMapRaw)) {
-    const matchedKey = Object.keys(ocrToHeaderMap).find(k =>
-      normalizeMaterialKey(ocrKey).includes(normalizeMaterialKey(k))
-    );
+    for (const [ocrKey, value] of Object.entries(materialMapRaw)) {
+    const headerTarget = matchMaterialHeaderFromKey(ocrKey, ocrToHeaderMap);
+    if (!headerTarget) continue;
 
-    if (!matchedKey) continue;
-
-    const headerTarget = ocrToHeaderMap[matchedKey];
     if (Array.isArray(headerTarget)) {
       headerTarget.forEach(h => materialMap[h] = (materialMap[h] || 0) + value);
     } else {
